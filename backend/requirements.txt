@@ -1,0 +1,9 @@
+fastapi==0.115.2
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pandas==2.2.3
+google-genai==1.56.0
+openai==1.52.2
+python-dotenv==1.0.1
+pytest==8.3.2
+httpx>=0.28.1,<1.0.0
