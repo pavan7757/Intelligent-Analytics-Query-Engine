@@ -82,6 +82,9 @@ def loader():
 
 @pytest.fixture
 def chain(monkeypatch):
+    for name in ("GROQ_API_KEY", "GROQ_MODEL", "OPENROUTER_MODEL", "XAI_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(interpreter_module.settings, "groq_api_key", None)
     for name in ("LLM_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("LLM_PROVIDER", "gemini")
@@ -272,7 +275,8 @@ def test_each_provider_invalid_json_advances_chain(api, chain, caplog, provider,
     attempt = next(item for item in body["provider_attempts"] if item["provider"] == provider)
     assert attempt["status"] == "failed" and attempt["http_status"] == 200
     assert attempt["query_plan_validation"] == "FAIL"
-    assert attempt["error_type"] == "invalid_json"
+    expected_error = "response_validation_error" if provider == "gemini" and not text.strip() else "invalid_json"
+    assert attempt["error_type"] == expected_error
     assert_safe(body, caplog)
 
 
@@ -483,6 +487,37 @@ def test_gemini_client_initialization_failure_still_attempts_openrouter(api, cha
     chain.gemini.assert_not_called()
     chain.grok.assert_not_called()
     assert_safe(body, caplog)
+
+
+def test_groq_backup_uses_its_own_endpoint_and_reports_provenance(api, chain, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-only-groq-placeholder")
+    monkeypatch.setenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    chain.gemini.side_effect = sdk_failure(503)
+    original_route = chain.post.side_effect
+
+    def route(url, **kwargs):
+        if url == "https://api.groq.com/openai/v1/chat/completions":
+            assert kwargs["headers"]["Authorization"] == "Bearer test-only-groq-placeholder"
+            assert kwargs["json"]["model"] == "openai/gpt-oss-120b"
+            return chat_response("grok")
+        return original_route(url, **kwargs)
+
+    chain.openrouter.return_value = chat_response("openrouter", status=503)
+    chain.post.side_effect = route
+    body = submit(api)
+    assert body["interpreter_source"] == "groq"
+    assert body["fallback_used"] is True
+    assert body["provider_model"] == "openai/gpt-oss-120b"
+    assert "Groq GenAI" in body["explanation"]
+    assert body["provider_attempts"][-1]["status"] == "success"
+    chain.grok.assert_not_called()
+
+
+def test_gemini_retries_only_transient_server_errors(chain, loader):
+    QueryInterpreter(loader)
+    retry = chain.constructor.call_args.kwargs["http_options"]["retry_options"]
+    assert retry["attempts"] == 3
+    assert retry["http_status_codes"] == [502, 503, 504]
 
 
 @pytest.mark.parametrize("provider", PROVIDERS)

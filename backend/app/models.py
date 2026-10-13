@@ -40,11 +40,31 @@ class ComparisonPlan(BaseModel):
     target_column: str | None = None
 
 
+class RatioPlan(BaseModel):
+    denominator: str
+    denominator_aggregation: Literal["count", "sum", "mean"] = "count"
+    output_name: str = "ratio"
+
+
+class GrowthPlan(BaseModel):
+    date_column: str
+    period: Literal["year"] = "year"
+
+
+class ReaggregationPlan(BaseModel):
+    group_by: list[str]
+    aggregation: Literal["sum", "mean", "count", "min", "max"] = "sum"
+
+
 class QueryPlan(BaseModel):
     operation: Literal[
         "aggregation", "filter", "ranking", "top_n_per_group",
         "contribution", "comparison", "nested", "time_series",
     ]
+    ratio: RatioPlan | None = None
+    growth: GrowthPlan | None = None
+    reaggregation: ReaggregationPlan | None = None
+    target_condition: Literal["below", "above", "met"] | None = None
     metric: str | None = None
     aggregation: Literal["sum", "mean", "count", "min", "max"] = "sum"
     group_by: list[str] = Field(default_factory=list)

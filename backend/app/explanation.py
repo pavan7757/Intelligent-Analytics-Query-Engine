@@ -31,6 +31,8 @@ def format_time_filter(time_filter: dict[str, Any] | None) -> str:
 
 
 def _provenance(interpreter_source: str, fallback_used: bool) -> str:
+    if interpreter_source == "groq":
+        return "The structured plan was supplied by Groq GenAI after earlier providers were unavailable or returned invalid responses."
     if interpreter_source == "gemini":
         return "The structured plan was supplied by Gemini GenAI."
     if interpreter_source == "openrouter":
@@ -149,6 +151,16 @@ def build_explanation(
             "and achievement_percentage is actual divided by target times 100. "
             "Missing target matches have null target-derived values; zero targets have no achievement percentage."
         )
+    if plan.get("ratio"):
+        ratio = plan["ratio"]
+        parts.append(f"Divided the aggregate by {ratio['denominator_aggregation']}({ratio['denominator']}) to calculate {ratio['output_name']}.")
+    if plan.get("reaggregation"):
+        stage = plan["reaggregation"]
+        parts.append(f"After ranking and selection, calculated {stage['aggregation']}({metric}) by {', '.join(stage['group_by'])}.")
+    if plan.get("growth"):
+        parts.append("Compared consecutive calendar years using (current - previous) / previous; missing or zero prior values yield null growth.")
+    if plan.get("target_condition"):
+        parts.append(f"Retained results where actual was {plan['target_condition']} target.")
     if plan.get("ambiguity"):
         parts.append("Assumptions and ambiguities: " + "; ".join(plan["ambiguity"]) + ". Confidence was reduced.")
     parts.append(_provenance(interpreter_source, fallback_used))

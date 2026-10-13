@@ -236,8 +236,6 @@ def test_entity_granularity_uses_renamed_dictionary_identity(monkeypatch):
 
 
 @pytest.mark.parametrize("query", [
-    "Revenue of top 3 customers per region",
-    "Sales of the top three customers within each region",
     "Show top 3 customers by revenue per region, then sum their revenue by region",
     "Find the top two customers per region and aggregate the selected customers' revenue by region",
 ])

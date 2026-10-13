@@ -93,6 +93,11 @@ export default function App() {
               <Table data={response.result} />
               {response.result.length === 0 && <p className="empty" role="status">No matching records found.</p>}
             </>}
+          {response.fallback_used && response.fallback_reason && (
+            <p className="provider-note" role="status">
+              <strong>Note:</strong> {response.fallback_reason}
+            </p>
+          )}
           <form className="feedback" onSubmit={saveFeedback}>
             <label htmlFor="feedback">Correct this interpretation (optional)</label>
             <textarea id="feedback" value={feedback} onChange={(e) => setFeedback(e.target.value)} placeholder="Describe the corrected meaning or field mapping" />

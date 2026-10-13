@@ -32,7 +32,7 @@ The supplied dataset files are present in the project root:
 | `nl_queries.json` | Assignment query corpus and intended logic |
 | `feedback_log.csv` | Persisted interpretation corrections |
 
-Both CSV files must exist because the loader reads them on each query. The sales data must contain rows for analytical execution. Missing JSON files load as empty dictionaries; include both supplied JSON files to retain business context and automatic dataset detection. The query corpus describes assignment expectations and is not a guarantee that every listed feature is implemented.
+Both CSV files must exist because the loader reads them on each query. The sales data must contain rows for analytical execution. Missing JSON files load as empty dictionaries; include both supplied JSON files to retain business context and automatic dataset detection. The query corpus describes assignment expectations. Queries are interpreted and calculated from the CSV data; the corpus is never used as a question-to-answer lookup.
 
 With an empty `DATASET_DIR`, configuration searches the project root and other local candidate directories for all four supplied dataset files. Set `DATASET_DIR` explicitly to an absolute directory when using another dataset. The feedback CSV is created there when needed, so this directory must be writable.
 
@@ -81,6 +81,8 @@ FRONTEND_ORIGIN=http://localhost:5173
 Replace the Gemini placeholder locally with your own key. To run without provider calls, leave **all three** credential variables empty; a placeholder is a nonempty credential and will otherwise be sent to the provider.
 
 The backend loads only the project-root `.env`, resolved from `backend/app/config.py`, with `override=False`. Existing process environment variables take precedence over `.env`. Restart the backend after changing configuration.
+
+Optional backups use `OPENROUTER_API_KEY` with `OPENROUTER_MODEL`, `GROQ_API_KEY` with `GROQ_MODEL`, and `XAI_API_KEY` with `XAI_MODEL`. Groq and Grok/xAI are separate providers: a Groq key belongs in `GROQ_API_KEY` and is sent only to the Groq endpoint. Gemini retries HTTP 502, 503 and 504 failures up to three total attempts before trying backups. Provider fallback details appear as a small note below the result.
 
 | Variable | Behavior |
 | --- | --- |
@@ -145,7 +147,8 @@ The frontend clears previous results when a new query is submitted and after a f
 - Highest/lowest rankings, global Top N and Top N within partitions. Explicit numeric or number-word counts take precedence over an implicit single highest result.
 - Contribution/share/percentage-of-total calculations over grouped results.
 - Filter + grouping + ranking combinations within one aggregation stage.
-- Overall or grouped actual-versus-target comparisons when the target data has compatible fields and additive grain.
+- Overall or grouped actual-versus-target comparisons when the target data has compatible fields and additive grain, including below/above/met-target result filtering.
+- Aggregate ratios, consecutive-calendar-year growth, and aggregation of ranked selections represented by validated plan fields.
 - Month, year, quarter, week and day grouping, explicit year filters, and supported absolute date boundaries.
 
 Fields are resolved against physical columns, detected types and dictionary mappings. Bare customer entities resolve to identity fields when available, while customer segments remain a separate dimension. Revenue can be derived as `quantity * unit_price * (1 - discount)` when absent as a physical column. The engine does not evaluate arbitrary dictionary formulas; a dictionary definition alone does not make every derived metric executable.
@@ -172,9 +175,9 @@ Generated logic and explanations describe the validated, executed filters, Boole
 ## Known limitations and assumptions
 
 - Relative dates such as "last month", "today" and "year to date" are unsupported and explicitly rejected. Use supported absolute dates or years.
-- Named-month filtering such as "in March" or "in Feb" is not supported by the current natural-language parser. Month grouping is supported and retains the year in each bucket.
-- Average order value (AOV), arbitrary formula metrics and year-over-year (YoY) growth are unsupported, even when the dictionary or query corpus names them.
-- QueryPlan supports one aggregation stage. Requests to rank/select entities and then reaggregate them, including multi-stage nested calculations, are rejected rather than simplified. Ordinary filter/group/rank combinations are supported.
+- Named months and abbreviations support calendar filtering with an optional year. An omitted year uses the only year in a single-year dataset; otherwise it includes that month across all dataset years, with an explicit assumption. Monthly targets are filtered to the same calendar period.
+- Average order value (AOV) calculates aggregate revenue divided by non-null order-ID count, with null for a zero denominator. YoY growth joins consecutive calendar-year totals within each requested group; missing previous years and zero baselines produce null. Filtering an output year retains its prior-year baseline. Arbitrary formula metrics remain unsupported.
+- Ranked selection followed by aggregation is supported for requests such as total profit of the top two products per country: first aggregate each entity, rank within its partition, select N, then aggregate selected values by the partition. Other multi-stage pipelines are rejected when they cannot be represented safely. Growth combined with ranking, ratios or target comparison requires further stages and is rejected.
 - Explicit "sort/order by" clauses, including sorting by a separate field, are unsupported. Use supported highest/lowest rankings, which order by the analytical metric.
 - Median, percentile, variance and other unimplemented aggregations are rejected. Unknown fields, operators and essential constraints must be resolved or rejected.
 - Target comparisons require compatible additive totals. Incompatible grouping, filtering or time grain returns a controlled analytical error.

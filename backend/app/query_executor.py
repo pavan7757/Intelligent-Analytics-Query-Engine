@@ -62,7 +62,7 @@ class QueryExecutor:
         if plan.metric and plan.metric not in frame.columns:
             raise QueryExecutionError(f"The requested metric is unavailable: {plan.metric}")
         if plan.time_filter:
-            if plan.time_filter.year:
+            if plan.time_filter.year and not plan.growth:
                 frame = frame[frame[time_column].dt.year == plan.time_filter.year]
             if plan.time_filter.month:
                 frame = frame[frame[time_column].dt.month == plan.time_filter.month]
@@ -120,7 +120,19 @@ class QueryExecutor:
                 grouped = frame.groupby(group_by, dropna=False, observed=False)
             else:
                 grouped = frame
-            if plan.aggregation == "count":
+            if plan.ratio:
+                denominator = plan.ratio.denominator
+                if denominator not in frame.columns:
+                    raise QueryExecutionError(f"Ratio denominator is unavailable: {denominator}")
+                if group_by:
+                    numerator = grouped[plan.metric].agg(plan.aggregation)
+                    divisor = grouped[denominator].agg(plan.ratio.denominator_aggregation)
+                    result_frame = (numerator / divisor.replace(0, math.nan)).reset_index(name=plan.metric)
+                else:
+                    divisor = frame[denominator].agg(plan.ratio.denominator_aggregation)
+                    value = frame[plan.metric].agg(plan.aggregation) / divisor if divisor else math.nan
+                    result_frame = pd.DataFrame({plan.metric: [value]})
+            elif plan.aggregation == "count":
                 if group_by:
                     result_frame = grouped.size().reset_index(name=plan.metric)
                 else:
@@ -146,6 +158,24 @@ class QueryExecutor:
                 result_frame = result_frame.sort_values(by=sort_column, ascending=plan.sort == "asc", na_position="last").head(plan.limit)
             elif group_by:
                 result_frame = result_frame.sort_values(by=group_by, na_position="last")
+            if plan.reaggregation:
+                keys = plan.reaggregation.group_by
+                if not set(keys).issubset(result_frame.columns):
+                    raise QueryExecutionError("Reaggregation fields must be present in the selected results.")
+                result_frame = result_frame.groupby(keys, dropna=False)[plan.metric].agg(plan.reaggregation.aggregation).reset_index()
+            if plan.growth:
+                keys = [field for field in group_by if field != "year"]
+                prior = result_frame[[*keys, "year", plan.metric]].copy()
+                prior["year"] = prior["year"] + 1
+                prior = prior.rename(columns={plan.metric: "previous_year_value"})
+                result_frame = result_frame.merge(prior, on=[*keys, "year"], how="left", validate="one_to_one")
+                baseline = result_frame["previous_year_value"].replace(0, math.nan)
+                result_frame["yoy_growth"] = (result_frame[plan.metric] - baseline) / baseline
+                result_frame["yoy_growth_percentage"] = result_frame["yoy_growth"] * 100
+                if plan.time_filter and plan.time_filter.year:
+                    result_frame = result_frame[result_frame["year"] == plan.time_filter.year]
+            if plan.ratio:
+                result_frame = result_frame.rename(columns={plan.metric: plan.ratio.output_name})
             result = result_frame.to_dict(orient="records")
 
         if plan.requires_targets:
@@ -192,6 +222,14 @@ class QueryExecutor:
                 target_metric = (comparison.target_metric or comparison.target_column) if comparison else None
                 target_metric = target_metric or self.schema.find_target_column(plan.metric or "")
                 steps.append(f"compare with target {target_metric}: actual, target, variance, achievement_percentage")
+        if plan.ratio:
+            steps.append(f"divide by {plan.ratio.denominator_aggregation}({plan.ratio.denominator}); output {plan.ratio.output_name}")
+        if plan.reaggregation:
+            steps.append(f"after selection, {plan.reaggregation.aggregation}({plan.metric}) by {', '.join(plan.reaggregation.group_by)}")
+        if plan.growth:
+            steps.append("join consecutive calendar years; (current - previous) / previous; missing or zero previous value yields null")
+        if plan.target_condition:
+            steps.append(f"retain actual {plan.target_condition} target")
         if plan.ambiguity:
             steps.append("assumptions/ambiguities: " + "; ".join(plan.ambiguity))
         return " -> ".join(steps)
@@ -224,12 +262,12 @@ class QueryExecutor:
             if column in self._TIME_DIMENSIONS and column not in frame.columns
         ]
         needs_time = bool(derived or plan.time_filter or (
-            plan.operation == "time_series"
+            plan.operation == "time_series" or plan.growth
             and not any(column in self._TIME_DIMENSIONS for column in group_by)
         ))
         if not needs_time:
             return None
-        requested = plan.time_filter.column if plan.time_filter else None
+        requested = plan.time_filter.column if plan.time_filter else (plan.growth.date_column if plan.growth else None)
         time_column = self.schema.resolve_date_column(
             requested=requested, preferred_fields=[*group_by, *plan.resolved_fields],
         )
@@ -320,12 +358,20 @@ class QueryExecutor:
                 "The targets dataset cannot support the requested comparison grouping: "
                 + ", ".join(missing_groups)
             )
-        if plan.time_filter and format_time_filter(plan.time_filter.model_dump()):
-            raise QueryExecutionError(
-                "The targets dataset does not define a matching date field for this time-filtered comparison."
-            )
-
         target = self.loader.targets.copy()
+        if plan.time_filter and format_time_filter(plan.time_filter.model_dump()):
+            if "month" not in target.columns:
+                raise QueryExecutionError("Time-filtered targets require a compatible month field.")
+            if plan.time_filter.start or plan.time_filter.end or plan.time_filter.quarter:
+                raise QueryExecutionError("Monthly targets require a whole-month or calendar-year filter.")
+            dates = pd.to_datetime(target["month"], errors="coerce")
+            if dates.isna().any():
+                raise QueryExecutionError("Targets contain invalid month values.")
+            if plan.time_filter.year:
+                target = target[dates.dt.year == plan.time_filter.year]
+                dates = dates.loc[target.index]
+            if plan.time_filter.month:
+                target = target[dates.dt.month == plan.time_filter.month]
         if plan.filter_expression:
             predicates = expression_predicates(plan.filter_expression)
             if any(item.column not in target.columns or item.column == target_column for item in predicates):
@@ -400,5 +446,11 @@ class QueryExecutor:
         comparison["actual"] = comparison[plan.metric]
         comparison["variance"] = comparison["actual"] - comparison["target"]
         comparison["achievement_percentage"] = comparison["actual"] / comparison["target"].replace(0, math.nan) * 100
+        if plan.target_condition == "below":
+            comparison = comparison[comparison["actual"] < comparison["target"]]
+        elif plan.target_condition == "above":
+            comparison = comparison[comparison["actual"] > comparison["target"]]
+        elif plan.target_condition == "met":
+            comparison = comparison[comparison["actual"] >= comparison["target"]]
         comparison = comparison.drop(columns=[plan.metric])
         return comparison.to_dict(orient="records")

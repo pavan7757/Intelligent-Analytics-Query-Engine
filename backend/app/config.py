@@ -63,6 +63,8 @@ class Settings:
     openrouter_model: str = os.getenv("OPENROUTER_MODEL", "").strip()
     xai_api_key: str | None = os.getenv("XAI_API_KEY") or None
     xai_model: str = os.getenv("XAI_MODEL", "").strip()
+    groq_api_key: str | None = os.getenv("GROQ_API_KEY") or None
+    groq_model: str = os.getenv("GROQ_MODEL", "").strip()
     frontend_origin: str = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 
 

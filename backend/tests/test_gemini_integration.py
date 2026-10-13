@@ -32,7 +32,7 @@ VALID_PLAN = {
 
 @pytest.fixture
 def provider(monkeypatch):
-    for name in ("LLM_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY"):
+    for name in ("LLM_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY", "GROQ_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("LLM_PROVIDER", "gemini")
     monkeypatch.setenv("GEMINI_API_KEY", TEST_CREDENTIAL)
@@ -40,7 +40,7 @@ def provider(monkeypatch):
     monkeypatch.setattr(interpreter_module.settings, "llm_api_key", None)
     monkeypatch.setattr(interpreter_module.settings, "llm_model", "gemini-2.5-flash")
     # A configured backup must not turn these isolated primary-provider tests live.
-    for name in ("openrouter_api_key", "xai_api_key"):
+    for name in ("openrouter_api_key", "xai_api_key", "groq_api_key"):
         monkeypatch.setattr(interpreter_module.settings, name, None, raising=False)
     generate = Mock(return_value=SimpleNamespace(text=json.dumps(VALID_PLAN), parsed=None))
     client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
@@ -143,11 +143,50 @@ def test_configured_model_is_not_silently_replaced(provider, loader, monkeypatch
     assert config_module._normalize_model_name(model, "gemini") == model
 
 
-@pytest.mark.parametrize("text", ["not JSON", "", "```json\n" + json.dumps(VALID_PLAN) + "\n```"])
+@pytest.mark.parametrize("parsed", [VALID_PLAN, QueryPlan.model_validate(VALID_PLAN)])
+def test_valid_parsed_plan_with_empty_text_preserves_gemini(api, provider, parsed):
+    provider.generate.return_value = SimpleNamespace(text="", parsed=parsed)
+    body = send_query(api)
+    assert body["interpreter_source"] == "gemini"
+    assert body["fallback_used"] is False
+    assert body["query_plan_validation"] == "PASS"
+    assert body["provider_http_status"] == 200
+    assert body["result"] == [
+        {"region": "APAC", "revenue": 31.0},
+        {"region": "EMEA", "revenue": 60.0},
+    ]
+
+
+def test_valid_nonempty_json_text_preserves_gemini(api, provider):
+    provider.generate.return_value = SimpleNamespace(text=json.dumps(VALID_PLAN), parsed=None)
+    body = send_query(api)
+    assert body["interpreter_source"] == "gemini"
+    assert body["fallback_used"] is False
+    assert body["query_plan_validation"] == "PASS"
+
+
+def test_invalid_parsed_plan_uses_existing_fallback(api, provider, caplog):
+    provider.generate.return_value = SimpleNamespace(text="", parsed={"operation": "execute_python"})
+    body = send_query(api)
+    assert_safe_fallback(body, "validation", caplog)
+    assert body["provider_http_status"] == 200
+    assert body["query_plan_validation"] == "FAIL"
+
+
+@pytest.mark.parametrize("text", ["not JSON", "```json\n" + json.dumps(VALID_PLAN) + "\n```"])
 def test_invalid_or_markdown_json_uses_safe_fallback(api, provider, caplog, text):
     provider.generate.return_value = SimpleNamespace(text=text, parsed=None)
     body = send_query(api)
     assert_safe_fallback(body, "json", caplog)
+    assert body["provider_http_status"] == 200
+    assert body["query_plan_validation"] == "FAIL"
+
+
+@pytest.mark.parametrize("text", ["", "   ", None, 123])
+def test_empty_or_nonstring_text_uses_existing_fallback(api, provider, caplog, text):
+    provider.generate.return_value = SimpleNamespace(text=text, parsed=None)
+    body = send_query(api)
+    assert_safe_fallback(body, "validation", caplog)
     assert body["provider_http_status"] == 200
     assert body["query_plan_validation"] == "FAIL"
 

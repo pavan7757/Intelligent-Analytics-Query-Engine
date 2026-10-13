@@ -78,7 +78,7 @@ def query(request: QueryRequest) -> JSONResponse:
         interpreter = QueryInterpreter(loader)
         plan = interpreter.interpret(request.query, FeedbackStore().get_relevant(request.query))
         interpreter_source = getattr(interpreter, "interpreter_source", "deterministic_fallback")
-        fallback_used = interpreter_source in {"openrouter", "grok", "deterministic_fallback"}
+        fallback_used = interpreter_source in {"openrouter", "grok", "groq", "deterministic_fallback"}
         provider_metadata = {
             "fallback_reason": getattr(interpreter, "fallback_reason", None) if fallback_used else None,
             "provider_http_status": getattr(interpreter, "provider_http_status", None),

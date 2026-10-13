@@ -1,3 +1,5 @@
+import calendar
+import pandas as pd
 import json
 import logging
 import os
@@ -15,7 +17,7 @@ except Exception:  # pragma: no cover - optional dependency depending on install
     genai = None
 
 from .data_loader import DatasetLoader
-from .models import ComparisonPlan, FilterExpression, FilterPlan, QueryPlan, TimeFilterPlan
+from .models import RatioPlan, GrowthPlan, ReaggregationPlan, ComparisonPlan, FilterExpression, FilterPlan, QueryPlan, TimeFilterPlan
 from .boolean_filters import expression_predicates
 from .filter_parser import RequestedFilterParser, FilterSyntaxError, combine_filters, filter_signature
 from .schema_manager import SchemaManager
@@ -69,7 +71,7 @@ class QueryInterpreter:
 
     def _record_provider_error(self, exc: Exception, provider: str = "gemini") -> None:
         """Classify errors without formatting provider bodies, URLs or secrets."""
-        label = {"gemini": "Gemini", "openrouter": "OpenRouter", "grok": "Grok"}[provider]
+        label = {"gemini": "Gemini", "openrouter": "OpenRouter", "grok": "Grok", "groq": "Groq"}[provider]
         code = getattr(exc, "code", None)
         if not isinstance(code, int):
             code = getattr(exc, "status_code", None)
@@ -124,7 +126,10 @@ class QueryInterpreter:
         try:
             return genai.Client(api_key=api_key, http_options={
                 "timeout": 30000,
-                "retry_options": {"attempts": 1},
+                "retry_options": {
+                    "attempts": 3, "initial_delay": 1, "max_delay": 2,
+                    "http_status_codes": [502, 503, 504],
+                },
             })
         except Exception:
             self._provider_failure("configuration_error", "Gemini client initialization failed. Check provider configuration.")
@@ -147,18 +152,23 @@ class QueryInterpreter:
             },
         )
         self.provider_http_status = 200
-        text = getattr(response, "text", None)
-        if text is not None:
-            return json.loads(text)
         payload = getattr(response, "parsed", None)
         if isinstance(payload, BaseModel):
             return payload.model_dump()
         if isinstance(payload, dict):
             return payload
+        text = getattr(response, "text", None)
+        if isinstance(text, str) and text.strip():
+            return json.loads(text)
         raise ProviderResponseError("Empty provider response.")
 
     @staticmethod
     def _backup_configuration(provider: str) -> tuple[str | None, str]:
+        if provider == "groq":
+            return (
+                os.getenv("GROQ_API_KEY") or settings.groq_api_key,
+                (os.getenv("GROQ_MODEL") or settings.groq_model or "").strip(),
+            )
         if provider == "openrouter":
             return (
                 os.getenv("OPENROUTER_API_KEY") or settings.openrouter_api_key,
@@ -174,6 +184,7 @@ class QueryInterpreter:
         endpoint = {
             "openrouter": "https://openrouter.ai/api/v1/chat/completions",
             "grok": "https://api.x.ai/v1/chat/completions",
+            "groq": "https://api.groq.com/openai/v1/chat/completions",
         }[provider]
         response = httpx.post(
             endpoint,
@@ -208,11 +219,15 @@ class QueryInterpreter:
     def _call_grok(self, context: str) -> dict[str, Any]:
         return self._call_chat_provider("grok", context)
 
+    def _call_groq(self, context: str) -> dict[str, Any]:
+        return self._call_chat_provider("groq", context)
+
     def _validate_provider_payload(self, payload: Any) -> QueryPlan:
         if not isinstance(payload, dict) or set(payload) - set(QueryPlan.model_fields):
             raise ProviderResponseError("Provider response contains an unsupported structure or fields.")
         credentials = [
             os.getenv("LLM_API_KEY"), os.getenv("GEMINI_API_KEY"), os.getenv("GOOGLE_API_KEY"),
+            os.getenv("GROQ_API_KEY"), settings.groq_api_key,
             os.getenv("OPENROUTER_API_KEY"), os.getenv("XAI_API_KEY"),
             settings.llm_api_key, settings.openrouter_api_key, settings.xai_api_key,
         ]
@@ -222,6 +237,68 @@ class QueryInterpreter:
         return QueryPlan.model_validate(payload)
 
     def interpret(self, query: str, feedback: list[dict[str, Any]] | None = None) -> QueryPlan:
+        """Compose supported analytical stages, then ground the base plan normally."""
+        original = query
+        ratio = bool(re.search(r"\b(?:aov|avg_order_value|average\s+order\s+value|mean\s+order\s+value)\b", query, re.I))
+        growth = bool(re.search(r"\b(?:yoy|year[ -]over[ -]year|annual\s+growth)\b", query, re.I))
+        if ratio:
+            query = re.sub(r"\b(?:aov|avg_order_value|average\s+order\s+value|mean\s+order\s+value)\b", "total revenue", query, flags=re.I)
+        if growth:
+            query = re.sub(r"\b(?:yoy|year[ -]over[ -]year|annual)\s*(?:growth|change)?(?:\s+in)?\b", "total", query, flags=re.I)
+        nested = re.search(r"^\s*(?:show\s+|calculate\s+)?(.+?)\s+(?:of|from)\s+(?:the\s+)?((?:top|bottom|highest|lowest|best|worst)\b.+)$", query, re.I)
+        outer_aggregation = None
+        if (
+            nested and self._resolved_metric_phrase(nested.group(1), original)
+            and not self._infer_ranking_request(nested.group(1))["is_ranking"]
+            and self._infer_ranked_dimension(nested.group(2))
+            and self._infer_metric(nested.group(2)) in {None, self._infer_metric(nested.group(1))}
+        ):
+            outer_aggregation = self._infer_aggregation(nested.group(1), self._infer_metric(nested.group(1)))
+            query = nested.group(2) + " by " + self._infer_metric(nested.group(1))
+        plan = self._interpret_base(query, feedback)
+        if not plan.is_supported:
+            return plan
+        if ratio:
+            order_field = self.schema.canonical_field("order_id") or self._resolve_dimension("order")
+            if not order_field:
+                plan.is_supported = False
+                plan.unresolved_terms.append("Average order value requires an order identity field.")
+            else:
+                plan.ratio = RatioPlan(denominator=order_field, output_name="avg_order_value")
+        if growth and (plan.ratio or plan.limit or plan.requires_targets or plan.contribution_percentage or (plan.time_filter and (plan.time_filter.start or plan.time_filter.end))):
+            plan.is_supported = False
+            plan.unresolved_terms.append("Growth combined with ranking, ratios or targets requires a further calculation stage.")
+        if growth:
+            date_column = self.schema.resolve_date_column()
+            if not date_column:
+                plan.is_supported = False
+                plan.unresolved_terms.append("Year-over-year growth requires an unambiguous date field.")
+            else:
+                plan.growth = GrowthPlan(date_column=date_column)
+                plan.group_by = list(dict.fromkeys([*plan.group_by, "year"]))
+                plan.ambiguity.append("Growth uses consecutive calendar years; missing prior years and zero baselines return null.")
+        if outer_aggregation:
+            if not plan.partition_by or not plan.limit:
+                plan.is_supported = False
+                plan.unresolved_terms.append("Reaggregation requires explicit selection and output groups.")
+            else:
+                plan.reaggregation = ReaggregationPlan(group_by=plan.partition_by, aggregation=outer_aggregation)
+        named_month = re.search(self._MONTH_PATTERN, original, re.I)
+        if named_month and plan.time_filter and named_month.group(2) is None and not re.search(r"\b(?:19|20)\d{2}\b", original):
+            if plan.time_filter.year:
+                plan.ambiguity.append(f"No year was specified; using the dataset's only calendar year, {plan.time_filter.year}.")
+            else:
+                plan.ambiguity.append("No year was specified; matching the requested month across all dataset years.")
+        if plan.requires_targets:
+            if re.search(r"\b(?:missed|below|under|shortfall)\b", original, re.I):
+                plan.target_condition = "below"
+            elif re.search(r"\b(?:exceeded|above|beat)\b", original, re.I):
+                plan.target_condition = "above"
+            elif re.search(r"\bmet\b", original, re.I):
+                plan.target_condition = "met"
+        return QueryPlan.model_validate(plan.model_dump())
+
+    def _interpret_base(self, query: str, feedback: list[dict[str, Any]] | None = None) -> QueryPlan:
         if not query.strip():
             raise QueryInterpretationError("The query cannot be empty.")
         context = self._build_context(query, feedback)
@@ -237,6 +314,10 @@ class QueryInterpreter:
             ("openrouter", self._backup_configuration("openrouter")[1], self._call_openrouter),
             ("grok", self._backup_configuration("grok")[1], self._call_grok),
         )
+        if self._backup_configuration("groq")[0]:
+            providers = providers[:2] + (
+                ("groq", self._backup_configuration("groq")[1], self._call_groq),
+            ) + providers[2:]
         for provider, model, call in providers:
             skip_reason = None
             skip_type = "configuration_error"
@@ -245,12 +326,12 @@ class QueryInterpreter:
                 skip_type = self._gemini_unavailable_type or "provider_unavailable"
             elif provider != "gemini":
                 api_key, _ = self._backup_configuration(provider)
-                label = "OpenRouter" if provider == "openrouter" else "Grok"
+                label = {"openrouter": "OpenRouter", "grok": "Grok", "groq": "Groq"}[provider]
                 if not api_key:
                     skip_reason = f"{label} API key is missing from the application configuration."
                     skip_type = "missing_api_key"
                 elif not model:
-                    variable = "OPENROUTER_MODEL" if provider == "openrouter" else "XAI_MODEL"
+                    variable = {"openrouter": "OPENROUTER_MODEL", "grok": "XAI_MODEL", "groq": "GROQ_MODEL"}[provider]
                     skip_reason = f"{label} model is missing; configure {variable}."
             if skip_reason:
                 self.provider_attempts.append({
@@ -487,6 +568,8 @@ The exact required QueryPlan JSON Schema follows:
             operation = "contribution"
         if comparison:
             operation = "comparison"
+            if comparison.target_group and not group_by:
+                group_by = [comparison.target_group]
         if self._is_filter_only_query(query) and not ranking["is_ranking"] and operation != "comparison" and not group_by and not re.search(
             r"\b(?:total|sum|average|avg|mean|count|minimum|min|maximum|max)\b", lowered,
         ):
@@ -659,6 +742,7 @@ The exact required QueryPlan JSON Schema follows:
 
     def _requested_filter_intent(self, query: str):
         """Retain Boolean structure and reject any unconsumed explicit predicate."""
+        query = self._without_named_month(query)
         parser = RequestedFilterParser(self.schema, self._resolve_dimension)
         nodes = []
         errors = []
@@ -751,7 +835,32 @@ The exact required QueryPlan JSON Schema follows:
             errors.append("Unsupported Boolean operator; only AND/OR composition is available.")
         return (combine_filters("and", nodes) if nodes else None), list(dict.fromkeys(errors))
 
+    _MONTHS = {name.casefold(): number for number in range(1, 13)
+               for name in (calendar.month_name[number], calendar.month_abbr[number])}
+    _MONTH_PATTERN = r"\b(?:in|for|during)\s+(" + "|".join(_MONTHS) + r")(?:\s+(\d{4}))?\b"
+
+    def _without_named_month(self, query: str) -> str:
+        return re.sub(self._MONTH_PATTERN, " ", query, flags=re.I)
+
     def _requested_calendar_filter(self, query: str):
+        named = list(re.finditer(self._MONTH_PATTERN, query, re.I))
+        if named:
+            remaining = self._without_named_month(query)
+            if re.search(r"\b(?:before|after|since|until|through|prior\s+to|later\s+than|earlier\s+than)\s+(?:year\s+)?\d{4}|\b\d{4}-\d{2}-\d{2}\b", remaining, re.I):
+                return None, ["Combining a named month with date boundaries requires an explicit date range."]
+            column = self.schema.resolve_date_column()
+            if not column or len(named) != 1:
+                return None, ["Specify one month and an unambiguous date field."]
+            month = self._MONTHS[named[0].group(1).casefold()]
+            years = re.findall(r"\b(?:19|20)\d{2}\b", query)
+            if len(set(years)) > 1:
+                return None, ["Multiple calendar years require an explicit range."]
+            year = int(years[0]) if years else None
+            if year is None:
+                available_years = pd.to_datetime(self.loader.sales[column], errors="coerce", format="mixed").dt.year.dropna().unique()
+                if len(available_years) == 1:
+                    year = int(available_years[0])
+            return TimeFilterPlan(column=column, month=month, year=year), []
         matches = list(re.finditer(
             r"\b(for|in|during|year|before|prior\s+to|earlier\s+than|after|later\s+than|since|from|to|until|through|as\s+of|up\s+to)"
             r"\s+(?:the\s+)?(?:year\s+)?(\d{4}(?:-\d{2}-\d{2})?)\b", query, re.IGNORECASE,
@@ -818,6 +927,7 @@ The exact required QueryPlan JSON Schema follows:
     def _find_unresolved_terms(
         self, query: str, metric: str | None, group_by: list[str], filters: list[FilterPlan]
     ) -> list[str]:
+        query = self._without_named_month(query)
         lowered = query.lower()
         unresolved = []
 
@@ -1314,7 +1424,7 @@ The exact required QueryPlan JSON Schema follows:
         dimension = self._infer_ranked_dimension(query)
         singular_superlative = bool(
             dimension and not ordering["requested"]
-            and re.search(r"\b(?:highest|lowest|most|least|best|worst|largest|biggest|greatest|smallest)\b", lowered)
+            and re.search(r"\b(?:top|bottom|highest|lowest|most|least|best|worst|largest|biggest|greatest|smallest)\b", lowered)
             and not re.search(r"\b(?:rank|ranked|ranking|sort|sorted|order|ordered)\b", lowered)
             and not any(
                 self._resolve_dimension(word) == dimension
@@ -1395,7 +1505,7 @@ The exact required QueryPlan JSON Schema follows:
         partitions = []
         for pattern in patterns:
             for match in re.finditer(pattern, lowered):
-                candidate = match.group(1).strip()
+                candidate = re.split(r"\b(?:by|where|with|for|in)\b", match.group(1), maxsplit=1)[0].strip()
                 resolved = self._resolve_dimension(candidate)
                 if resolved and resolved not in partitions:
                     partitions.append(resolved)
@@ -1598,7 +1708,7 @@ The exact required QueryPlan JSON Schema follows:
         lowered = query.lower()
         comparison_markers = (
             "compare", "vs", "versus", "against target", "actual vs target",
-            "achievement", "performance against target", "target achievement",
+            "achievement", "performance against target", "target achievement", "missed", "below", "exceeded", "met its target", "beat",
         )
         if not any(marker in lowered for marker in comparison_markers):
             return None
